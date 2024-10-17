@@ -150,11 +150,11 @@ where
             0x01 => {
                 self.pending_read_bool_value = Some(true);
                 Ok(TType::Bool)
-            },
+            }
             0x02 => {
                 self.pending_read_bool_value = Some(false);
                 Ok(TType::Bool)
-            },
+            }
             ttu8 => u8_to_type(ttu8),
         }?;
 
@@ -184,7 +184,7 @@ where
                     field_type,
                     id: Some(self.last_read_field_id),
                 })
-            },
+            }
         }
     }
 
@@ -205,7 +205,7 @@ where
                         message: format!("cannot convert {} into bool", unkn),
                     })),
                 }
-            },
+            }
         }
     }
 

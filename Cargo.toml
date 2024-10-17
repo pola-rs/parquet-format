@@ -1,6 +1,6 @@
 [package]
 name = "polars-parquet-format"
-version = "2.10.0-rc.0"
+version = "2.10.0"
 authors = [
   "Apache Thrift contributors <dev@thrift.apache.org>",
   "Jorge Leitao <jorgecarleitao@gmail.com>",

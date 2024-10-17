@@ -144,11 +144,11 @@ impl<R: VarIntAsyncReader + AsyncRead + Unpin + Send> TInputStreamProtocol
             0x01 => {
                 self.pending_read_bool_value = Some(true);
                 Ok(TType::Bool)
-            },
+            }
             0x02 => {
                 self.pending_read_bool_value = Some(false);
                 Ok(TType::Bool)
-            },
+            }
             ttu8 => u8_to_type(ttu8),
         }?;
 
@@ -178,7 +178,7 @@ impl<R: VarIntAsyncReader + AsyncRead + Unpin + Send> TInputStreamProtocol
                     field_type,
                     id: Some(self.last_read_field_id),
                 })
-            },
+            }
         }
     }
 
@@ -199,7 +199,7 @@ impl<R: VarIntAsyncReader + AsyncRead + Unpin + Send> TInputStreamProtocol
                         message: format!("cannot convert {} into bool", unkn),
                     })),
                 }
-            },
+            }
         }
     }
 

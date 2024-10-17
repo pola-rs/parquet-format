@@ -34,7 +34,7 @@ let
   parquet_thrift_definitions = builtins.fetchGit {
     url = "https://github.com/apache/parquet-format";
     ref = "master";
-    rev = "43c891a4494f85e2fe0e56f4ef408bcc60e8da48";
+    rev = "4f208158dba80ff4bff4afaa4441d7270103dff6";
   };
   generate_parquet_format = pkgs.writeShellScriptBin "generate_parquet_format" ''
     thrift --gen rs ${parquet_thrift_definitions}/src/main/thrift/parquet.thrift

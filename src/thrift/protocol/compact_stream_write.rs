@@ -138,12 +138,12 @@ where
                 }
                 self.pending_write_bool_field_identifier = Some(identifier.clone());
                 Ok(0)
-            },
+            }
             _ => {
                 let field_type = type_to_u8(identifier.field_type);
                 let field_id = identifier.id.expect("non-stop field should have field id");
                 self.write_field_header(field_type, field_id).await
-            },
+            }
         }
     }
 
@@ -163,14 +163,14 @@ where
                 let field_id = pending.id.expect("bool field should have a field id");
                 let field_type_as_u8 = if b { 0x01 } else { 0x02 };
                 self.write_field_header(field_type_as_u8, field_id).await
-            },
+            }
             None => {
                 if b {
                     self.write_byte(0x01).await
                 } else {
                     self.write_byte(0x02).await
                 }
-            },
+            }
         }
     }
 

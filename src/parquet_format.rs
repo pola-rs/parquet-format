@@ -6,17 +6,19 @@
 use std::convert::{From, TryInto};
 use std::default::Default;
 
+use crate::thrift;
 #[cfg(feature = "async")]
 use async_trait::async_trait;
-use thrift::protocol::{
-    field_id, verify_required_field_exists, ReadThrift, TFieldIdentifier, TInputProtocol,
-    TListIdentifier, TOutputProtocol, TStructIdentifier, TType,
-};
+
+use thrift::protocol::field_id;
+use thrift::protocol::verify_required_field_exists;
 #[cfg(feature = "async")]
 use thrift::protocol::{AsyncReadThrift, TInputStreamProtocol, TOutputStreamProtocol};
+use thrift::protocol::{
+    ReadThrift, TFieldIdentifier, TInputProtocol, TListIdentifier, TOutputProtocol,
+    TStructIdentifier, TType,
+};
 use thrift::{ProtocolError, ProtocolErrorKind};
-
-use crate::thrift;
 
 /// Types supported by Parquet.  These types are intended to be used in combination
 /// with the encodings to control the on disk storage format.
@@ -130,12 +132,12 @@ impl ConvertedType {
     /// a list is converted into an optional field containing a repeated field for its
     /// values
     pub const LIST: ConvertedType = ConvertedType(3);
-    /// an enum is converted into a binary field
+    /// an enum is converted into a BYTE_ARRAY field
     pub const ENUM: ConvertedType = ConvertedType(4);
     /// A decimal value.
     ///
-    /// This may be used to annotate binary or fixed primitive types. The
-    /// underlying byte array stores the unscaled value encoded as two's
+    /// This may be used to annotate BYTE_ARRAY or FIXED_LEN_BYTE_ARRAY primitive
+    /// types. The underlying byte array stores the unscaled value encoded as two's
     /// complement using big-endian byte order (the most significant byte is the
     /// zeroth element). The value of the decimal is the value * 10^{-scale}.
     ///
@@ -198,7 +200,7 @@ impl ConvertedType {
     pub const JSON: ConvertedType = ConvertedType(19);
     /// An embedded BSON document
     ///
-    /// A BSON document embedded within a single BINARY column.
+    /// A BSON document embedded within a single BYTE_ARRAY column.
     pub const BSON: ConvertedType = ConvertedType(20);
     /// An interval of time
     ///
@@ -323,9 +325,9 @@ impl From<&ConvertedType> for i32 {
 pub struct FieldRepetitionType(pub i32);
 
 impl FieldRepetitionType {
-    /// This field is required (can not be null) and each record has exactly 1 value.
+    /// This field is required (can not be null) and each row has exactly 1 value.
     pub const REQUIRED: FieldRepetitionType = FieldRepetitionType(0);
-    /// The field is optional (can be null) and each record has 0 or 1 values.
+    /// The field is optional (can be null) and each row has 0 or 1 values.
     pub const OPTIONAL: FieldRepetitionType = FieldRepetitionType(1);
     /// The field is repeated and can contain 0 or more values
     pub const REPEATED: FieldRepetitionType = FieldRepetitionType(2);
@@ -434,12 +436,15 @@ impl Encoding {
     pub const DELTA_BYTE_ARRAY: Encoding = Encoding(7);
     /// Dictionary encoding: the ids are encoded using the RLE encoding
     pub const RLE_DICTIONARY: Encoding = Encoding(8);
-    /// Encoding for floating-point data.
+    /// Encoding for fixed-width data (FLOAT, DOUBLE, INT32, INT64, FIXED_LEN_BYTE_ARRAY).
     /// K byte-streams are created where K is the size in bytes of the data type.
-    /// The individual bytes of an FP value are scattered to the corresponding stream and
+    /// The individual bytes of a value are scattered to the corresponding stream and
     /// the streams are concatenated.
     /// This itself does not reduce the size of the data but can lead to better compression
     /// afterwards.
+    ///
+    /// Added in 2.8 for FLOAT and DOUBLE.
+    /// Support for INT32, INT64 and FIXED_LEN_BYTE_ARRAY added in 2.11.
     pub const BYTE_STREAM_SPLIT: Encoding = Encoding(9);
     pub const ENUM_VALUES: &'static [Self] = &[
         Self::PLAIN,
@@ -776,6 +781,275 @@ impl From<&BoundaryOrder> for i32 {
 }
 
 //
+// SizeStatistics
+//
+
+/// A structure for capturing metadata for estimating the unencoded,
+/// uncompressed size of data written. This is useful for readers to estimate
+/// how much memory is needed to reconstruct data in their memory model and for
+/// fine grained filter pushdown on nested structures (the histograms contained
+/// in this structure can help determine the number of nulls at a particular
+/// nesting level and maximum length of lists).
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SizeStatistics {
+    /// The number of physical bytes stored for BYTE_ARRAY data values assuming
+    /// no encoding. This is exclusive of the bytes needed to store the length of
+    /// each byte array. In other words, this field is equivalent to the `(size
+    /// of PLAIN-ENCODING the byte array values) - (4 bytes * number of values
+    /// written)`. To determine unencoded sizes of other types readers can use
+    /// schema information multiplied by the number of non-null and null values.
+    /// The number of null/non-null values can be inferred from the histograms
+    /// below.
+    ///
+    /// For example, if a column chunk is dictionary-encoded with dictionary
+    /// ["a", "bc", "cde"], and a data page contains the indices [0, 0, 1, 2],
+    /// then this value for that data page should be 7 (1 + 1 + 2 + 3).
+    ///
+    /// This field should only be set for types that use BYTE_ARRAY as their
+    /// physical type.
+    pub unencoded_byte_array_data_bytes: Option<i64>,
+    /// When present, there is expected to be one element corresponding to each
+    /// repetition (i.e. size=max repetition_level+1) where each element
+    /// represents the number of times the repetition level was observed in the
+    /// data.
+    ///
+    /// This field may be omitted if max_repetition_level is 0 without loss
+    /// of information.
+    ///
+    pub repetition_level_histogram: Option<Vec<i64>>,
+    /// Same as repetition_level_histogram except for definition levels.
+    ///
+    /// This field may be omitted if max_definition_level is 0 or 1 without
+    /// loss of information.
+    ///
+    pub definition_level_histogram: Option<Vec<i64>>,
+}
+
+impl SizeStatistics {
+    pub fn new<F1, F2, F3>(
+        unencoded_byte_array_data_bytes: F1,
+        repetition_level_histogram: F2,
+        definition_level_histogram: F3,
+    ) -> SizeStatistics
+    where
+        F1: Into<Option<i64>>,
+        F2: Into<Option<Vec<i64>>>,
+        F3: Into<Option<Vec<i64>>>,
+    {
+        SizeStatistics {
+            unencoded_byte_array_data_bytes: unencoded_byte_array_data_bytes.into(),
+            repetition_level_histogram: repetition_level_histogram.into(),
+            definition_level_histogram: definition_level_histogram.into(),
+        }
+    }
+
+    pub fn read_from_in_protocol<T: TInputProtocol>(
+        i_prot: &mut T,
+    ) -> thrift::Result<SizeStatistics> {
+        ReadThrift::read_from_in_protocol(i_prot)
+    }
+
+    #[cfg(feature = "async")]
+    pub async fn stream_from_in_protocol<T: TInputStreamProtocol>(
+        i_prot: &mut T,
+    ) -> thrift::Result<SizeStatistics> {
+        AsyncReadThrift::stream_from_in_protocol(i_prot).await
+    }
+
+    pub fn write_to_out_protocol<T: TOutputProtocol>(
+        &self,
+        o_prot: &mut T,
+    ) -> thrift::Result<usize> {
+        let mut written = 0;
+        let struct_ident = TStructIdentifier::new("SizeStatistics");
+        written += o_prot.write_struct_begin(&struct_ident)?;
+        if let Some(fld_var) = self.unencoded_byte_array_data_bytes {
+            written += o_prot.write_field_begin(&TFieldIdentifier::new(
+                "unencoded_byte_array_data_bytes",
+                TType::I64,
+                1,
+            ))?;
+            written += o_prot.write_i64(fld_var)?;
+            written += o_prot.write_field_end()?;
+        }
+        if let Some(ref fld_var) = self.repetition_level_histogram {
+            written += o_prot.write_field_begin(&TFieldIdentifier::new(
+                "repetition_level_histogram",
+                TType::List,
+                2,
+            ))?;
+            written += o_prot
+                .write_list_begin(&TListIdentifier::new(TType::I64, fld_var.len().try_into()?))?;
+            for e in fld_var {
+                written += o_prot.write_i64(*e)?;
+            }
+            written += o_prot.write_list_end()?;
+            written += o_prot.write_field_end()?;
+        }
+        if let Some(ref fld_var) = self.definition_level_histogram {
+            written += o_prot.write_field_begin(&TFieldIdentifier::new(
+                "definition_level_histogram",
+                TType::List,
+                3,
+            ))?;
+            written += o_prot
+                .write_list_begin(&TListIdentifier::new(TType::I64, fld_var.len().try_into()?))?;
+            for e in fld_var {
+                written += o_prot.write_i64(*e)?;
+            }
+            written += o_prot.write_list_end()?;
+            written += o_prot.write_field_end()?;
+        }
+        written += o_prot.write_field_stop()?;
+        written += o_prot.write_struct_end()?;
+        Ok(written)
+    }
+    #[cfg(feature = "async")]
+    pub async fn write_to_out_stream_protocol<T: TOutputStreamProtocol>(
+        &self,
+        o_prot: &mut T,
+    ) -> thrift::Result<usize> {
+        let mut written = 0;
+        let struct_ident = TStructIdentifier::new("SizeStatistics");
+        written += o_prot.write_struct_begin(&struct_ident).await?;
+        if let Some(fld_var) = self.unencoded_byte_array_data_bytes {
+            written += o_prot
+                .write_field_begin(&TFieldIdentifier::new(
+                    "unencoded_byte_array_data_bytes",
+                    TType::I64,
+                    1,
+                ))
+                .await?;
+            written += o_prot.write_i64(fld_var).await?;
+            written += o_prot.write_field_end()?;
+        }
+        if let Some(ref fld_var) = self.repetition_level_histogram {
+            written += o_prot
+                .write_field_begin(&TFieldIdentifier::new(
+                    "repetition_level_histogram",
+                    TType::List,
+                    2,
+                ))
+                .await?;
+            written += o_prot
+                .write_list_begin(&TListIdentifier::new(TType::I64, fld_var.len().try_into()?))
+                .await?;
+            for e in fld_var {
+                written += o_prot.write_i64(*e).await?;
+            }
+            written += o_prot.write_list_end().await?;
+            written += o_prot.write_field_end()?;
+        }
+        if let Some(ref fld_var) = self.definition_level_histogram {
+            written += o_prot
+                .write_field_begin(&TFieldIdentifier::new(
+                    "definition_level_histogram",
+                    TType::List,
+                    3,
+                ))
+                .await?;
+            written += o_prot
+                .write_list_begin(&TListIdentifier::new(TType::I64, fld_var.len().try_into()?))
+                .await?;
+            for e in fld_var {
+                written += o_prot.write_i64(*e).await?;
+            }
+            written += o_prot.write_list_end().await?;
+            written += o_prot.write_field_end()?;
+        }
+        written += o_prot.write_field_stop().await?;
+        written += o_prot.write_struct_end()?;
+        Ok(written)
+    }
+}
+
+impl ReadThrift for SizeStatistics {
+    fn read_from_in_protocol<T: TInputProtocol>(i_prot: &mut T) -> thrift::Result<SizeStatistics> {
+        i_prot.read_struct_begin()?;
+        let mut f_1: Option<i64> = None;
+        let mut f_2: Option<Vec<i64>> = None;
+        let mut f_3: Option<Vec<i64>> = None;
+        loop {
+            let field_ident = i_prot.read_field_begin()?;
+            if field_ident.field_type == TType::Stop {
+                break;
+            }
+            let field_id = field_id(&field_ident)?;
+            match field_id {
+                1 => {
+                    let val = i_prot.read_i64()?;
+                    f_1 = Some(val);
+                }
+                2 => {
+                    let val = i_prot.read_list()?;
+                    f_2 = Some(val);
+                }
+                3 => {
+                    let val = i_prot.read_list()?;
+                    f_3 = Some(val);
+                }
+                _ => {
+                    i_prot.skip(field_ident.field_type)?;
+                }
+            };
+            i_prot.read_field_end()?;
+        }
+        i_prot.read_struct_end()?;
+        let ret = SizeStatistics {
+            unencoded_byte_array_data_bytes: f_1,
+            repetition_level_histogram: f_2,
+            definition_level_histogram: f_3,
+        };
+        Ok(ret)
+    }
+}
+
+#[cfg(feature = "async")]
+#[async_trait]
+impl AsyncReadThrift for SizeStatistics {
+    async fn stream_from_in_protocol<T: TInputStreamProtocol>(
+        i_prot: &mut T,
+    ) -> thrift::Result<SizeStatistics> {
+        i_prot.read_struct_begin().await?;
+        let mut f_1: Option<i64> = None;
+        let mut f_2: Option<Vec<i64>> = None;
+        let mut f_3: Option<Vec<i64>> = None;
+        loop {
+            let field_ident = i_prot.read_field_begin().await?;
+            if field_ident.field_type == TType::Stop {
+                break;
+            }
+            let field_id = field_id(&field_ident)?;
+            match field_id {
+                1 => {
+                    let val = i_prot.read_i64().await?;
+                    f_1 = Some(val);
+                }
+                2 => {
+                    let val = i_prot.read_list().await?;
+                    f_2 = Some(val);
+                }
+                3 => {
+                    let val = i_prot.read_list().await?;
+                    f_3 = Some(val);
+                }
+                _ => {
+                    i_prot.skip(field_ident.field_type).await?;
+                }
+            };
+            i_prot.read_field_end().await?;
+        }
+        i_prot.read_struct_end().await?;
+        let ret = SizeStatistics {
+            unencoded_byte_array_data_bytes: f_1,
+            repetition_level_histogram: f_2,
+            definition_level_histogram: f_3,
+        };
+        Ok(ret)
+    }
+}
+
+//
 // Statistics
 //
 
@@ -796,26 +1070,43 @@ pub struct Statistics {
     /// signed.
     pub max: Option<Vec<u8>>,
     pub min: Option<Vec<u8>>,
-    /// count of null value in the column
+    /// Count of null values in the column.
+    ///
+    /// Writers SHOULD always write this field even if it is zero (i.e. no null value)
+    /// or the column is not nullable.
+    /// Readers MUST distinguish between null_count not being present and null_count == 0.
+    /// If null_count is not present, readers MUST NOT assume null_count == 0.
     pub null_count: Option<i64>,
     /// count of distinct values occurring
     pub distinct_count: Option<i64>,
-    /// Min and max values for the column, determined by its ColumnOrder.
+    /// Lower and upper bound values for the column, determined by its ColumnOrder.
+    ///
+    /// These may be the actual minimum and maximum values found on a page or column
+    /// chunk, but can also be (more compact) values that do not exist on a page or
+    /// column chunk. For example, instead of storing "Blart Versenwald III", a writer
+    /// may set min_value="B", max_value="C". Such more compact values must still be
+    /// valid values within the column's logical type.
     ///
     /// Values are encoded using PLAIN encoding, except that variable-length byte
     /// arrays do not include a length prefix.
     pub max_value: Option<Vec<u8>>,
     pub min_value: Option<Vec<u8>>,
+    /// If true, max_value is the actual maximum value for a column
+    pub is_max_value_exact: Option<bool>,
+    /// If true, min_value is the actual minimum value for a column
+    pub is_min_value_exact: Option<bool>,
 }
 
 impl Statistics {
-    pub fn new<F1, F2, F3, F4, F5, F6>(
+    pub fn new<F1, F2, F3, F4, F5, F6, F7, F8>(
         max: F1,
         min: F2,
         null_count: F3,
         distinct_count: F4,
         max_value: F5,
         min_value: F6,
+        is_max_value_exact: F7,
+        is_min_value_exact: F8,
     ) -> Statistics
     where
         F1: Into<Option<Vec<u8>>>,
@@ -824,6 +1115,8 @@ impl Statistics {
         F4: Into<Option<i64>>,
         F5: Into<Option<Vec<u8>>>,
         F6: Into<Option<Vec<u8>>>,
+        F7: Into<Option<bool>>,
+        F8: Into<Option<bool>>,
     {
         Statistics {
             max: max.into(),
@@ -832,6 +1125,8 @@ impl Statistics {
             distinct_count: distinct_count.into(),
             max_value: max_value.into(),
             min_value: min_value.into(),
+            is_max_value_exact: is_max_value_exact.into(),
+            is_min_value_exact: is_min_value_exact.into(),
         }
     }
 
@@ -890,6 +1185,24 @@ impl Statistics {
             written += o_prot.write_bytes(fld_var)?;
             written += o_prot.write_field_end()?;
         }
+        if let Some(fld_var) = self.is_max_value_exact {
+            written += o_prot.write_field_begin(&TFieldIdentifier::new(
+                "is_max_value_exact",
+                TType::Bool,
+                7,
+            ))?;
+            written += o_prot.write_bool(fld_var)?;
+            written += o_prot.write_field_end()?;
+        }
+        if let Some(fld_var) = self.is_min_value_exact {
+            written += o_prot.write_field_begin(&TFieldIdentifier::new(
+                "is_min_value_exact",
+                TType::Bool,
+                8,
+            ))?;
+            written += o_prot.write_bool(fld_var)?;
+            written += o_prot.write_field_end()?;
+        }
         written += o_prot.write_field_stop()?;
         written += o_prot.write_struct_end()?;
         Ok(written)
@@ -944,6 +1257,20 @@ impl Statistics {
             written += o_prot.write_bytes(fld_var).await?;
             written += o_prot.write_field_end()?;
         }
+        if let Some(fld_var) = self.is_max_value_exact {
+            written += o_prot
+                .write_field_begin(&TFieldIdentifier::new("is_max_value_exact", TType::Bool, 7))
+                .await?;
+            written += o_prot.write_bool(fld_var).await?;
+            written += o_prot.write_field_end()?;
+        }
+        if let Some(fld_var) = self.is_min_value_exact {
+            written += o_prot
+                .write_field_begin(&TFieldIdentifier::new("is_min_value_exact", TType::Bool, 8))
+                .await?;
+            written += o_prot.write_bool(fld_var).await?;
+            written += o_prot.write_field_end()?;
+        }
         written += o_prot.write_field_stop().await?;
         written += o_prot.write_struct_end()?;
         Ok(written)
@@ -959,6 +1286,8 @@ impl ReadThrift for Statistics {
         let mut f_4: Option<i64> = None;
         let mut f_5: Option<Vec<u8>> = None;
         let mut f_6: Option<Vec<u8>> = None;
+        let mut f_7: Option<bool> = None;
+        let mut f_8: Option<bool> = None;
         loop {
             let field_ident = i_prot.read_field_begin()?;
             if field_ident.field_type == TType::Stop {
@@ -969,30 +1298,38 @@ impl ReadThrift for Statistics {
                 1 => {
                     let val = i_prot.read_bytes()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_bytes()?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_i64()?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = i_prot.read_i64()?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = i_prot.read_bytes()?;
                     f_5 = Some(val);
-                },
+                }
                 6 => {
                     let val = i_prot.read_bytes()?;
                     f_6 = Some(val);
-                },
+                }
+                7 => {
+                    let val = i_prot.read_bool()?;
+                    f_7 = Some(val);
+                }
+                8 => {
+                    let val = i_prot.read_bool()?;
+                    f_8 = Some(val);
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -1004,6 +1341,8 @@ impl ReadThrift for Statistics {
             distinct_count: f_4,
             max_value: f_5,
             min_value: f_6,
+            is_max_value_exact: f_7,
+            is_min_value_exact: f_8,
         };
         Ok(ret)
     }
@@ -1022,6 +1361,8 @@ impl AsyncReadThrift for Statistics {
         let mut f_4: Option<i64> = None;
         let mut f_5: Option<Vec<u8>> = None;
         let mut f_6: Option<Vec<u8>> = None;
+        let mut f_7: Option<bool> = None;
+        let mut f_8: Option<bool> = None;
         loop {
             let field_ident = i_prot.read_field_begin().await?;
             if field_ident.field_type == TType::Stop {
@@ -1032,30 +1373,38 @@ impl AsyncReadThrift for Statistics {
                 1 => {
                     let val = i_prot.read_bytes().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_bytes().await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_i64().await?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = i_prot.read_i64().await?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = i_prot.read_bytes().await?;
                     f_5 = Some(val);
-                },
+                }
                 6 => {
                     let val = i_prot.read_bytes().await?;
                     f_6 = Some(val);
-                },
+                }
+                7 => {
+                    let val = i_prot.read_bool().await?;
+                    f_7 = Some(val);
+                }
+                8 => {
+                    let val = i_prot.read_bool().await?;
+                    f_8 = Some(val);
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -1067,6 +1416,8 @@ impl AsyncReadThrift for Statistics {
             distinct_count: f_4,
             max_value: f_5,
             min_value: f_6,
+            is_max_value_exact: f_7,
+            is_min_value_exact: f_8,
         };
         Ok(ret)
     }
@@ -1602,6 +1953,94 @@ impl AsyncReadThrift for DateType {
 }
 
 //
+// Float16Type
+//
+
+#[derive(Clone, Copy, Default, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Float16Type {}
+
+impl Float16Type {
+    pub fn new() -> Float16Type {
+        Float16Type {}
+    }
+
+    pub fn read_from_in_protocol<T: TInputProtocol>(i_prot: &mut T) -> thrift::Result<Float16Type> {
+        ReadThrift::read_from_in_protocol(i_prot)
+    }
+
+    #[cfg(feature = "async")]
+    pub async fn stream_from_in_protocol<T: TInputStreamProtocol>(
+        i_prot: &mut T,
+    ) -> thrift::Result<Float16Type> {
+        AsyncReadThrift::stream_from_in_protocol(i_prot).await
+    }
+
+    pub fn write_to_out_protocol<T: TOutputProtocol>(
+        &self,
+        o_prot: &mut T,
+    ) -> thrift::Result<usize> {
+        let mut written = 0;
+        let struct_ident = TStructIdentifier::new("Float16Type");
+        written += o_prot.write_struct_begin(&struct_ident)?;
+        written += o_prot.write_field_stop()?;
+        written += o_prot.write_struct_end()?;
+        Ok(written)
+    }
+    #[cfg(feature = "async")]
+    pub async fn write_to_out_stream_protocol<T: TOutputStreamProtocol>(
+        &self,
+        o_prot: &mut T,
+    ) -> thrift::Result<usize> {
+        let mut written = 0;
+        let struct_ident = TStructIdentifier::new("Float16Type");
+        written += o_prot.write_struct_begin(&struct_ident).await?;
+        written += o_prot.write_field_stop().await?;
+        written += o_prot.write_struct_end()?;
+        Ok(written)
+    }
+}
+
+impl ReadThrift for Float16Type {
+    fn read_from_in_protocol<T: TInputProtocol>(i_prot: &mut T) -> thrift::Result<Float16Type> {
+        i_prot.read_struct_begin()?;
+        loop {
+            let field_ident = i_prot.read_field_begin()?;
+            if field_ident.field_type == TType::Stop {
+                break;
+            }
+            let _ = field_id(&field_ident)?;
+            i_prot.skip(field_ident.field_type)?;
+            i_prot.read_field_end()?;
+        }
+        i_prot.read_struct_end()?;
+        let ret = Float16Type {};
+        Ok(ret)
+    }
+}
+
+#[cfg(feature = "async")]
+#[async_trait]
+impl AsyncReadThrift for Float16Type {
+    async fn stream_from_in_protocol<T: TInputStreamProtocol>(
+        i_prot: &mut T,
+    ) -> thrift::Result<Float16Type> {
+        i_prot.read_struct_begin().await?;
+        loop {
+            let field_ident = i_prot.read_field_begin().await?;
+            if field_ident.field_type == TType::Stop {
+                break;
+            }
+            let _ = field_id(&field_ident)?;
+            i_prot.skip(field_ident.field_type).await?;
+            i_prot.read_field_end().await?;
+        }
+        i_prot.read_struct_end().await?;
+        let ret = Float16Type {};
+        Ok(ret)
+    }
+}
+
+//
 // NullType
 //
 
@@ -1700,10 +2139,13 @@ impl AsyncReadThrift for NullType {
 
 /// Decimal logical type annotation
 ///
+/// Scale must be zero or a positive integer less than or equal to the precision.
+/// Precision must be a non-zero positive integer.
+///
 /// To maintain forward-compatibility in v1, implementations using this logical
 /// type must also set scale and precision on the annotated SchemaElement.
 ///
-/// Allowed for physical types: INT32, INT64, FIXED, and BINARY
+/// Allowed for physical types: INT32, INT64, FIXED_LEN_BYTE_ARRAY, and BYTE_ARRAY.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DecimalType {
     pub scale: i32,
@@ -1782,14 +2224,14 @@ impl ReadThrift for DecimalType {
                 1 => {
                     let val = i_prot.read_i32()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_i32()?;
                     f_2 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -1825,14 +2267,14 @@ impl AsyncReadThrift for DecimalType {
                 1 => {
                     let val = i_prot.read_i32().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_i32().await?;
                     f_2 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -2153,19 +2595,19 @@ impl TimeUnit {
                     o_prot.write_field_begin(&TFieldIdentifier::new("MILLIS", TType::Struct, 1))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             TimeUnit::MICROS(ref f) => {
                 written +=
                     o_prot.write_field_begin(&TFieldIdentifier::new("MICROS", TType::Struct, 2))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             TimeUnit::NANOS(ref f) => {
                 written +=
                     o_prot.write_field_begin(&TFieldIdentifier::new("NANOS", TType::Struct, 3))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
         }
         written += o_prot.write_field_stop()?;
         written += o_prot.write_struct_end()?;
@@ -2185,21 +2627,21 @@ impl TimeUnit {
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             TimeUnit::MICROS(ref f) => {
                 written += o_prot
                     .write_field_begin(&TFieldIdentifier::new("MICROS", TType::Struct, 2))
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             TimeUnit::NANOS(ref f) => {
                 written += o_prot
                     .write_field_begin(&TFieldIdentifier::new("NANOS", TType::Struct, 3))
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
         }
         written += o_prot.write_field_stop().await?;
         written += o_prot.write_struct_end()?;
@@ -2225,25 +2667,25 @@ impl ReadThrift for TimeUnit {
                         ret = Some(TimeUnit::MILLIS(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 2 => {
                     let val = MicroSeconds::read_from_in_protocol(i_prot)?;
                     if ret.is_none() {
                         ret = Some(TimeUnit::MICROS(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 3 => {
                     let val = NanoSeconds::read_from_in_protocol(i_prot)?;
                     if ret.is_none() {
                         ret = Some(TimeUnit::NANOS(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
                     received_field_count += 1;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -2291,25 +2733,25 @@ impl AsyncReadThrift for TimeUnit {
                         ret = Some(TimeUnit::MILLIS(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 2 => {
                     let val = MicroSeconds::stream_from_in_protocol(i_prot).await?;
                     if ret.is_none() {
                         ret = Some(TimeUnit::MICROS(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 3 => {
                     let val = NanoSeconds::stream_from_in_protocol(i_prot).await?;
                     if ret.is_none() {
                         ret = Some(TimeUnit::NANOS(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
                     received_field_count += 1;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -2426,14 +2868,14 @@ impl ReadThrift for TimestampType {
                 1 => {
                     let val = i_prot.read_bool()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = TimeUnit::read_from_in_protocol(i_prot)?;
                     f_2 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -2469,14 +2911,14 @@ impl AsyncReadThrift for TimestampType {
                 1 => {
                     let val = i_prot.read_bool().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = TimeUnit::stream_from_in_protocol(i_prot).await?;
                     f_2 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -2582,14 +3024,14 @@ impl ReadThrift for TimeType {
                 1 => {
                     let val = i_prot.read_bool()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = TimeUnit::read_from_in_protocol(i_prot)?;
                     f_2 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -2625,14 +3067,14 @@ impl AsyncReadThrift for TimeType {
                 1 => {
                     let val = i_prot.read_bool().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = TimeUnit::stream_from_in_protocol(i_prot).await?;
                     f_2 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -2739,14 +3181,14 @@ impl ReadThrift for IntType {
                 1 => {
                     let val = i_prot.read_i8()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_bool()?;
                     f_2 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -2782,14 +3224,14 @@ impl AsyncReadThrift for IntType {
                 1 => {
                     let val = i_prot.read_i8().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_bool().await?;
                     f_2 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -2812,7 +3254,7 @@ impl AsyncReadThrift for IntType {
 
 /// Embedded JSON logical type annotation
 ///
-/// Allowed for physical types: BINARY
+/// Allowed for physical types: BYTE_ARRAY
 #[derive(Clone, Copy, Default, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct JsonType {}
 
@@ -2903,7 +3345,7 @@ impl AsyncReadThrift for JsonType {
 
 /// Embedded BSON logical type annotation
 ///
-/// Allowed for physical types: BINARY
+/// Allowed for physical types: BYTE_ARRAY
 #[derive(Clone, Copy, Default, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BsonType {}
 
@@ -3007,6 +3449,7 @@ pub enum LogicalType {
     JSON(JsonType),
     BSON(BsonType),
     UUID(UUIDType),
+    FLOAT16(Float16Type),
 }
 
 impl LogicalType {
@@ -3033,25 +3476,25 @@ impl LogicalType {
                     o_prot.write_field_begin(&TFieldIdentifier::new("STRING", TType::Struct, 1))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::MAP(ref f) => {
                 written +=
                     o_prot.write_field_begin(&TFieldIdentifier::new("MAP", TType::Struct, 2))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::LIST(ref f) => {
                 written +=
                     o_prot.write_field_begin(&TFieldIdentifier::new("LIST", TType::Struct, 3))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::ENUM(ref f) => {
                 written +=
                     o_prot.write_field_begin(&TFieldIdentifier::new("ENUM", TType::Struct, 4))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::DECIMAL(ref f) => {
                 written += o_prot.write_field_begin(&TFieldIdentifier::new(
                     "DECIMAL",
@@ -3060,19 +3503,19 @@ impl LogicalType {
                 ))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::DATE(ref f) => {
                 written +=
                     o_prot.write_field_begin(&TFieldIdentifier::new("DATE", TType::Struct, 6))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::TIME(ref f) => {
                 written +=
                     o_prot.write_field_begin(&TFieldIdentifier::new("TIME", TType::Struct, 7))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::TIMESTAMP(ref f) => {
                 written += o_prot.write_field_begin(&TFieldIdentifier::new(
                     "TIMESTAMP",
@@ -3081,7 +3524,7 @@ impl LogicalType {
                 ))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::INTEGER(ref f) => {
                 written += o_prot.write_field_begin(&TFieldIdentifier::new(
                     "INTEGER",
@@ -3090,7 +3533,7 @@ impl LogicalType {
                 ))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::UNKNOWN(ref f) => {
                 written += o_prot.write_field_begin(&TFieldIdentifier::new(
                     "UNKNOWN",
@@ -3099,25 +3542,34 @@ impl LogicalType {
                 ))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::JSON(ref f) => {
                 written +=
                     o_prot.write_field_begin(&TFieldIdentifier::new("JSON", TType::Struct, 12))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::BSON(ref f) => {
                 written +=
                     o_prot.write_field_begin(&TFieldIdentifier::new("BSON", TType::Struct, 13))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::UUID(ref f) => {
                 written +=
                     o_prot.write_field_begin(&TFieldIdentifier::new("UUID", TType::Struct, 14))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
+            LogicalType::FLOAT16(ref f) => {
+                written += o_prot.write_field_begin(&TFieldIdentifier::new(
+                    "FLOAT16",
+                    TType::Struct,
+                    15,
+                ))?;
+                written += f.write_to_out_protocol(o_prot)?;
+                written += o_prot.write_field_end()?;
+            }
         }
         written += o_prot.write_field_stop()?;
         written += o_prot.write_struct_end()?;
@@ -3137,91 +3589,98 @@ impl LogicalType {
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::MAP(ref f) => {
                 written += o_prot
                     .write_field_begin(&TFieldIdentifier::new("MAP", TType::Struct, 2))
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::LIST(ref f) => {
                 written += o_prot
                     .write_field_begin(&TFieldIdentifier::new("LIST", TType::Struct, 3))
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::ENUM(ref f) => {
                 written += o_prot
                     .write_field_begin(&TFieldIdentifier::new("ENUM", TType::Struct, 4))
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::DECIMAL(ref f) => {
                 written += o_prot
                     .write_field_begin(&TFieldIdentifier::new("DECIMAL", TType::Struct, 5))
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::DATE(ref f) => {
                 written += o_prot
                     .write_field_begin(&TFieldIdentifier::new("DATE", TType::Struct, 6))
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::TIME(ref f) => {
                 written += o_prot
                     .write_field_begin(&TFieldIdentifier::new("TIME", TType::Struct, 7))
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::TIMESTAMP(ref f) => {
                 written += o_prot
                     .write_field_begin(&TFieldIdentifier::new("TIMESTAMP", TType::Struct, 8))
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::INTEGER(ref f) => {
                 written += o_prot
                     .write_field_begin(&TFieldIdentifier::new("INTEGER", TType::Struct, 10))
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::UNKNOWN(ref f) => {
                 written += o_prot
                     .write_field_begin(&TFieldIdentifier::new("UNKNOWN", TType::Struct, 11))
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::JSON(ref f) => {
                 written += o_prot
                     .write_field_begin(&TFieldIdentifier::new("JSON", TType::Struct, 12))
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::BSON(ref f) => {
                 written += o_prot
                     .write_field_begin(&TFieldIdentifier::new("BSON", TType::Struct, 13))
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             LogicalType::UUID(ref f) => {
                 written += o_prot
                     .write_field_begin(&TFieldIdentifier::new("UUID", TType::Struct, 14))
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
+            LogicalType::FLOAT16(ref f) => {
+                written += o_prot
+                    .write_field_begin(&TFieldIdentifier::new("FLOAT16", TType::Struct, 15))
+                    .await?;
+                written += f.write_to_out_stream_protocol(o_prot).await?;
+                written += o_prot.write_field_end()?;
+            }
         }
         written += o_prot.write_field_stop().await?;
         written += o_prot.write_struct_end()?;
@@ -3247,95 +3706,102 @@ impl ReadThrift for LogicalType {
                         ret = Some(LogicalType::STRING(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 2 => {
                     let val = MapType::read_from_in_protocol(i_prot)?;
                     if ret.is_none() {
                         ret = Some(LogicalType::MAP(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 3 => {
                     let val = ListType::read_from_in_protocol(i_prot)?;
                     if ret.is_none() {
                         ret = Some(LogicalType::LIST(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 4 => {
                     let val = EnumType::read_from_in_protocol(i_prot)?;
                     if ret.is_none() {
                         ret = Some(LogicalType::ENUM(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 5 => {
                     let val = DecimalType::read_from_in_protocol(i_prot)?;
                     if ret.is_none() {
                         ret = Some(LogicalType::DECIMAL(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 6 => {
                     let val = DateType::read_from_in_protocol(i_prot)?;
                     if ret.is_none() {
                         ret = Some(LogicalType::DATE(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 7 => {
                     let val = TimeType::read_from_in_protocol(i_prot)?;
                     if ret.is_none() {
                         ret = Some(LogicalType::TIME(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 8 => {
                     let val = TimestampType::read_from_in_protocol(i_prot)?;
                     if ret.is_none() {
                         ret = Some(LogicalType::TIMESTAMP(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 10 => {
                     let val = IntType::read_from_in_protocol(i_prot)?;
                     if ret.is_none() {
                         ret = Some(LogicalType::INTEGER(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 11 => {
                     let val = NullType::read_from_in_protocol(i_prot)?;
                     if ret.is_none() {
                         ret = Some(LogicalType::UNKNOWN(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 12 => {
                     let val = JsonType::read_from_in_protocol(i_prot)?;
                     if ret.is_none() {
                         ret = Some(LogicalType::JSON(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 13 => {
                     let val = BsonType::read_from_in_protocol(i_prot)?;
                     if ret.is_none() {
                         ret = Some(LogicalType::BSON(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 14 => {
                     let val = UUIDType::read_from_in_protocol(i_prot)?;
                     if ret.is_none() {
                         ret = Some(LogicalType::UUID(val));
                     }
                     received_field_count += 1;
-                },
+                }
+                15 => {
+                    let val = Float16Type::read_from_in_protocol(i_prot)?;
+                    if ret.is_none() {
+                        ret = Some(LogicalType::FLOAT16(val));
+                    }
+                    received_field_count += 1;
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
                     received_field_count += 1;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -3383,95 +3849,102 @@ impl AsyncReadThrift for LogicalType {
                         ret = Some(LogicalType::STRING(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 2 => {
                     let val = MapType::stream_from_in_protocol(i_prot).await?;
                     if ret.is_none() {
                         ret = Some(LogicalType::MAP(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 3 => {
                     let val = ListType::stream_from_in_protocol(i_prot).await?;
                     if ret.is_none() {
                         ret = Some(LogicalType::LIST(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 4 => {
                     let val = EnumType::stream_from_in_protocol(i_prot).await?;
                     if ret.is_none() {
                         ret = Some(LogicalType::ENUM(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 5 => {
                     let val = DecimalType::stream_from_in_protocol(i_prot).await?;
                     if ret.is_none() {
                         ret = Some(LogicalType::DECIMAL(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 6 => {
                     let val = DateType::stream_from_in_protocol(i_prot).await?;
                     if ret.is_none() {
                         ret = Some(LogicalType::DATE(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 7 => {
                     let val = TimeType::stream_from_in_protocol(i_prot).await?;
                     if ret.is_none() {
                         ret = Some(LogicalType::TIME(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 8 => {
                     let val = TimestampType::stream_from_in_protocol(i_prot).await?;
                     if ret.is_none() {
                         ret = Some(LogicalType::TIMESTAMP(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 10 => {
                     let val = IntType::stream_from_in_protocol(i_prot).await?;
                     if ret.is_none() {
                         ret = Some(LogicalType::INTEGER(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 11 => {
                     let val = NullType::stream_from_in_protocol(i_prot).await?;
                     if ret.is_none() {
                         ret = Some(LogicalType::UNKNOWN(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 12 => {
                     let val = JsonType::stream_from_in_protocol(i_prot).await?;
                     if ret.is_none() {
                         ret = Some(LogicalType::JSON(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 13 => {
                     let val = BsonType::stream_from_in_protocol(i_prot).await?;
                     if ret.is_none() {
                         ret = Some(LogicalType::BSON(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 14 => {
                     let val = UUIDType::stream_from_in_protocol(i_prot).await?;
                     if ret.is_none() {
                         ret = Some(LogicalType::UUID(val));
                     }
                     received_field_count += 1;
-                },
+                }
+                15 => {
+                    let val = Float16Type::stream_from_in_protocol(i_prot).await?;
+                    if ret.is_none() {
+                        ret = Some(LogicalType::FLOAT16(val));
+                    }
+                    received_field_count += 1;
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
                     received_field_count += 1;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -3509,7 +3982,7 @@ impl AsyncReadThrift for LogicalType {
 pub struct SchemaElement {
     /// Data type for this field. Not set if the current element is a non-leaf node
     pub type_: Option<Type>,
-    /// If type is FIXED_LEN_BYTE_ARRAY, this is the byte length of the vales.
+    /// If type is FIXED_LEN_BYTE_ARRAY, this is the byte length of the values.
     /// Otherwise, if specified, this is the maximum bit length to store any of the values.
     /// (e.g. a low cardinality INT col could have this set to 3).  Note that this is
     /// in the schema, and therefore fixed for the entire file.
@@ -3776,46 +4249,46 @@ impl ReadThrift for SchemaElement {
                 1 => {
                     let val = Type::read_from_in_protocol(i_prot)?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_i32()?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = FieldRepetitionType::read_from_in_protocol(i_prot)?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = i_prot.read_string()?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = i_prot.read_i32()?;
                     f_5 = Some(val);
-                },
+                }
                 6 => {
                     let val = ConvertedType::read_from_in_protocol(i_prot)?;
                     f_6 = Some(val);
-                },
+                }
                 7 => {
                     let val = i_prot.read_i32()?;
                     f_7 = Some(val);
-                },
+                }
                 8 => {
                     let val = i_prot.read_i32()?;
                     f_8 = Some(val);
-                },
+                }
                 9 => {
                     let val = i_prot.read_i32()?;
                     f_9 = Some(val);
-                },
+                }
                 10 => {
                     let val = LogicalType::read_from_in_protocol(i_prot)?;
                     f_10 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -3865,46 +4338,46 @@ impl AsyncReadThrift for SchemaElement {
                 1 => {
                     let val = Type::stream_from_in_protocol(i_prot).await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_i32().await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = FieldRepetitionType::stream_from_in_protocol(i_prot).await?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = i_prot.read_string().await?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = i_prot.read_i32().await?;
                     f_5 = Some(val);
-                },
+                }
                 6 => {
                     let val = ConvertedType::stream_from_in_protocol(i_prot).await?;
                     f_6 = Some(val);
-                },
+                }
                 7 => {
                     let val = i_prot.read_i32().await?;
                     f_7 = Some(val);
-                },
+                }
                 8 => {
                     let val = i_prot.read_i32().await?;
                     f_8 = Some(val);
-                },
+                }
                 9 => {
                     let val = i_prot.read_i32().await?;
                     f_9 = Some(val);
-                },
+                }
                 10 => {
                     let val = LogicalType::stream_from_in_protocol(i_prot).await?;
                     f_10 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -3934,7 +4407,12 @@ impl AsyncReadThrift for SchemaElement {
 /// Data page header
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DataPageHeader {
-    /// Number of values, including NULLs, in this data page. *
+    /// Number of values, including NULLs, in this data page.
+    ///
+    /// If a OffsetIndex is present, a page must begin at a row
+    /// boundary (repetition_level = 0). Otherwise, pages may begin
+    /// within a row (repetition_level > 0).
+    ///
     pub num_values: i32,
     /// Encoding used for this data page *
     pub encoding: Encoding,
@@ -3942,7 +4420,7 @@ pub struct DataPageHeader {
     pub definition_level_encoding: Encoding,
     /// Encoding used for repetition levels *
     pub repetition_level_encoding: Encoding,
-    /// Optional statistics for the data in this page*
+    /// Optional statistics for the data in this page *
     pub statistics: Option<Statistics>,
 }
 
@@ -4093,26 +4571,26 @@ impl ReadThrift for DataPageHeader {
                 1 => {
                     let val = i_prot.read_i32()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = Encoding::read_from_in_protocol(i_prot)?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = Encoding::read_from_in_protocol(i_prot)?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = Encoding::read_from_in_protocol(i_prot)?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = Statistics::read_from_in_protocol(i_prot)?;
                     f_5 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -4158,26 +4636,26 @@ impl AsyncReadThrift for DataPageHeader {
                 1 => {
                     let val = i_prot.read_i32().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = Encoding::stream_from_in_protocol(i_prot).await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = Encoding::stream_from_in_protocol(i_prot).await?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = Encoding::stream_from_in_protocol(i_prot).await?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = Statistics::stream_from_in_protocol(i_prot).await?;
                     f_5 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -4406,18 +4884,18 @@ impl ReadThrift for DictionaryPageHeader {
                 1 => {
                     let val = i_prot.read_i32()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = Encoding::read_from_in_protocol(i_prot)?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_bool()?;
                     f_3 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -4455,18 +4933,18 @@ impl AsyncReadThrift for DictionaryPageHeader {
                 1 => {
                     let val = i_prot.read_i32().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = Encoding::stream_from_in_protocol(i_prot).await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_bool().await?;
                     f_3 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -4499,21 +4977,24 @@ pub struct DataPageHeaderV2 {
     /// Number of NULL values, in this data page.
     /// Number of non-null = num_values - num_nulls which is also the number of values in the data section *
     pub num_nulls: i32,
-    /// Number of rows in this data page. which means pages change on record boundaries (r = 0) *
+    /// Number of rows in this data page. Every page must begin at a
+    /// row boundary (repetition_level = 0): rows must **not** be
+    /// split across page boundaries when using V2 data pages.
+    ///
     pub num_rows: i32,
     /// Encoding used for data in this page *
     pub encoding: Encoding,
-    /// length of the definition levels
+    /// Length of the definition levels
     pub definition_levels_byte_length: i32,
-    /// length of the repetition levels
+    /// Length of the repetition levels
     pub repetition_levels_byte_length: i32,
-    /// whether the values are compressed.
+    /// Whether the values are compressed.
     /// Which means the section of the page between
     /// definition_levels_byte_length + repetition_levels_byte_length + 1 and compressed_page_size (included)
     /// is compressed with the compression_codec.
     /// If missing it is considered compressed
     pub is_compressed: Option<bool>,
-    /// optional statistics for the data in this page *
+    /// Optional statistics for the data in this page *
     pub statistics: Option<Statistics>,
 }
 
@@ -4698,38 +5179,38 @@ impl ReadThrift for DataPageHeaderV2 {
                 1 => {
                     let val = i_prot.read_i32()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_i32()?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_i32()?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = Encoding::read_from_in_protocol(i_prot)?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = i_prot.read_i32()?;
                     f_5 = Some(val);
-                },
+                }
                 6 => {
                     let val = i_prot.read_i32()?;
                     f_6 = Some(val);
-                },
+                }
                 7 => {
                     let val = i_prot.read_bool()?;
                     f_7 = Some(val);
-                },
+                }
                 8 => {
                     let val = Statistics::read_from_in_protocol(i_prot)?;
                     f_8 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -4785,38 +5266,38 @@ impl AsyncReadThrift for DataPageHeaderV2 {
                 1 => {
                     let val = i_prot.read_i32().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_i32().await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_i32().await?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = Encoding::stream_from_in_protocol(i_prot).await?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = i_prot.read_i32().await?;
                     f_5 = Some(val);
-                },
+                }
                 6 => {
                     let val = i_prot.read_i32().await?;
                     f_6 = Some(val);
-                },
+                }
                 7 => {
                     let val = i_prot.read_bool().await?;
                     f_7 = Some(val);
-                },
+                }
                 8 => {
                     let val = Statistics::stream_from_in_protocol(i_prot).await?;
                     f_8 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -4975,7 +5456,7 @@ impl BloomFilterAlgorithm {
                     o_prot.write_field_begin(&TFieldIdentifier::new("BLOCK", TType::Struct, 1))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
         }
         written += o_prot.write_field_stop()?;
         written += o_prot.write_struct_end()?;
@@ -4995,7 +5476,7 @@ impl BloomFilterAlgorithm {
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
         }
         written += o_prot.write_field_stop().await?;
         written += o_prot.write_struct_end()?;
@@ -5023,11 +5504,11 @@ impl ReadThrift for BloomFilterAlgorithm {
                         ret = Some(BloomFilterAlgorithm::BLOCK(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
                     received_field_count += 1;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -5075,11 +5556,11 @@ impl AsyncReadThrift for BloomFilterAlgorithm {
                         ret = Some(BloomFilterAlgorithm::BLOCK(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
                     received_field_count += 1;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -5231,7 +5712,7 @@ impl BloomFilterHash {
                     o_prot.write_field_begin(&TFieldIdentifier::new("XXHASH", TType::Struct, 1))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
         }
         written += o_prot.write_field_stop()?;
         written += o_prot.write_struct_end()?;
@@ -5251,7 +5732,7 @@ impl BloomFilterHash {
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
         }
         written += o_prot.write_field_stop().await?;
         written += o_prot.write_struct_end()?;
@@ -5277,11 +5758,11 @@ impl ReadThrift for BloomFilterHash {
                         ret = Some(BloomFilterHash::XXHASH(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
                     received_field_count += 1;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -5329,11 +5810,11 @@ impl AsyncReadThrift for BloomFilterHash {
                         ret = Some(BloomFilterHash::XXHASH(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
                     received_field_count += 1;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -5489,7 +5970,7 @@ impl BloomFilterCompression {
                 ))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
         }
         written += o_prot.write_field_stop()?;
         written += o_prot.write_struct_end()?;
@@ -5509,7 +5990,7 @@ impl BloomFilterCompression {
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
         }
         written += o_prot.write_field_stop().await?;
         written += o_prot.write_struct_end()?;
@@ -5537,11 +6018,11 @@ impl ReadThrift for BloomFilterCompression {
                         ret = Some(BloomFilterCompression::UNCOMPRESSED(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
                     received_field_count += 1;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -5589,11 +6070,11 @@ impl AsyncReadThrift for BloomFilterCompression {
                         ret = Some(BloomFilterCompression::UNCOMPRESSED(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
                     received_field_count += 1;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -5747,22 +6228,22 @@ impl ReadThrift for BloomFilterHeader {
                 1 => {
                     let val = i_prot.read_i32()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = BloomFilterAlgorithm::read_from_in_protocol(i_prot)?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = BloomFilterHash::read_from_in_protocol(i_prot)?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = BloomFilterCompression::read_from_in_protocol(i_prot)?;
                     f_4 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -5806,22 +6287,22 @@ impl AsyncReadThrift for BloomFilterHeader {
                 1 => {
                     let val = i_prot.read_i32().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = BloomFilterAlgorithm::stream_from_in_protocol(i_prot).await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = BloomFilterHash::stream_from_in_protocol(i_prot).await?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = BloomFilterCompression::stream_from_in_protocol(i_prot).await?;
                     f_4 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -5856,32 +6337,22 @@ pub struct PageHeader {
     pub uncompressed_page_size: i32,
     /// Compressed (and potentially encrypted) page size in bytes, not including this header *
     pub compressed_page_size: i32,
-    /// The 32bit CRC for the page, to be be calculated as follows:
-    /// - Using the standard CRC32 algorithm
-    /// - On the data only, i.e. this header should not be included. 'Data'
-    ///   hereby refers to the concatenation of the repetition levels, the
-    ///   definition levels and the column value, in this exact order.
-    /// - On the encoded versions of the repetition levels, definition levels and
-    ///   column values
-    /// - On the compressed versions of the repetition levels, definition levels
-    ///   and column values where possible;
-    ///   - For v1 data pages, the repetition levels, definition levels and column
-    ///     values are always compressed together. If a compression scheme is
-    ///     specified, the CRC shall be calculated on the compressed version of
-    ///     this concatenation. If no compression scheme is specified, the CRC
-    ///     shall be calculated on the uncompressed version of this concatenation.
-    ///   - For v2 data pages, the repetition levels and definition levels are
-    ///     handled separately from the data and are never compressed (only
-    ///     encoded). If a compression scheme is specified, the CRC shall be
-    ///     calculated on the concatenation of the uncompressed repetition levels,
-    ///     uncompressed definition levels and the compressed column values.
-    ///     If no compression scheme is specified, the CRC shall be calculated on
-    ///     the uncompressed concatenation.
-    /// - In encrypted columns, CRC is calculated after page encryption; the
-    ///   encryption itself is performed after page compression (if compressed)
+    /// The 32-bit CRC checksum for the page, to be be calculated as follows:
+    ///
+    /// - The standard CRC32 algorithm is used (with polynomial 0x04C11DB7,
+    ///   the same as in e.g. GZip).
+    /// - All page types can have a CRC (v1 and v2 data pages, dictionary pages,
+    ///   etc.).
+    /// - The CRC is computed on the serialization binary representation of the page
+    ///   (as written to disk), excluding the page header. For example, for v1
+    ///   data pages, the CRC is computed on the concatenation of repetition levels,
+    ///   definition levels and column values (optionally compressed, optionally
+    ///   encrypted).
+    /// - The CRC computation therefore takes place after any compression
+    ///   and encryption steps, if any.
+    ///
     /// If enabled, this allows for disabling checksumming in HDFS if only a few
     /// pages need to be read.
-    ///
     pub crc: Option<i32>,
     pub data_page_header: Option<DataPageHeader>,
     pub index_page_header: Option<IndexPageHeader>,
@@ -6104,38 +6575,38 @@ impl ReadThrift for PageHeader {
                 1 => {
                     let val = PageType::read_from_in_protocol(i_prot)?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_i32()?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_i32()?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = i_prot.read_i32()?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = DataPageHeader::read_from_in_protocol(i_prot)?;
                     f_5 = Some(val);
-                },
+                }
                 6 => {
                     let val = IndexPageHeader::read_from_in_protocol(i_prot)?;
                     f_6 = Some(val);
-                },
+                }
                 7 => {
                     let val = DictionaryPageHeader::read_from_in_protocol(i_prot)?;
                     f_7 = Some(val);
-                },
+                }
                 8 => {
                     let val = DataPageHeaderV2::read_from_in_protocol(i_prot)?;
                     f_8 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -6185,38 +6656,38 @@ impl AsyncReadThrift for PageHeader {
                 1 => {
                     let val = PageType::stream_from_in_protocol(i_prot).await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_i32().await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_i32().await?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = i_prot.read_i32().await?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = DataPageHeader::stream_from_in_protocol(i_prot).await?;
                     f_5 = Some(val);
-                },
+                }
                 6 => {
                     let val = IndexPageHeader::stream_from_in_protocol(i_prot).await?;
                     f_6 = Some(val);
-                },
+                }
                 7 => {
                     let val = DictionaryPageHeader::stream_from_in_protocol(i_prot).await?;
                     f_7 = Some(val);
-                },
+                }
                 8 => {
                     let val = DataPageHeaderV2::stream_from_in_protocol(i_prot).await?;
                     f_8 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -6335,14 +6806,14 @@ impl ReadThrift for KeyValue {
                 1 => {
                     let val = i_prot.read_string()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_string()?;
                     f_2 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -6376,14 +6847,14 @@ impl AsyncReadThrift for KeyValue {
                 1 => {
                     let val = i_prot.read_string().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_string().await?;
                     f_2 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -6402,10 +6873,10 @@ impl AsyncReadThrift for KeyValue {
 // SortingColumn
 //
 
-/// Wrapper struct to specify sort order
+/// Sort order within a RowGroup of a leaf column
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SortingColumn {
-    /// The column index (in this row group) *
+    /// The ordinal position of the column (in this row group) *
     pub column_idx: i32,
     /// If true, indicates this column is sorted in descending order. *
     pub descending: bool,
@@ -6503,18 +6974,18 @@ impl ReadThrift for SortingColumn {
                 1 => {
                     let val = i_prot.read_i32()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_bool()?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_bool()?;
                     f_3 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -6554,18 +7025,18 @@ impl AsyncReadThrift for SortingColumn {
                 1 => {
                     let val = i_prot.read_i32().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_bool().await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_bool().await?;
                     f_3 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -6689,18 +7160,18 @@ impl ReadThrift for PageEncodingStats {
                 1 => {
                     let val = PageType::read_from_in_protocol(i_prot)?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = Encoding::read_from_in_protocol(i_prot)?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_i32()?;
                     f_3 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -6740,18 +7211,18 @@ impl AsyncReadThrift for PageEncodingStats {
                 1 => {
                     let val = PageType::stream_from_in_protocol(i_prot).await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = Encoding::stream_from_in_protocol(i_prot).await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_i32().await?;
                     f_3 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -6810,10 +7281,21 @@ pub struct ColumnMetaData {
     pub encoding_stats: Option<Vec<PageEncodingStats>>,
     /// Byte offset from beginning of file to Bloom filter data. *
     pub bloom_filter_offset: Option<i64>,
+    /// Size of Bloom filter data including the serialized header, in bytes.
+    /// Added in 2.10 so readers may not read this field from old files and
+    /// it can be obtained after the BloomFilterHeader has been deserialized.
+    /// Writers should write this field so readers can read the bloom filter
+    /// in a single I/O.
+    pub bloom_filter_length: Option<i32>,
+    /// Optional statistics to help estimate total memory when converted to in-memory
+    /// representations. The histograms contained in these statistics can
+    /// also be useful in some cases for more fine-grained nullability/list length
+    /// filter pushdown.
+    pub size_statistics: Option<SizeStatistics>,
 }
 
 impl ColumnMetaData {
-    pub fn new<F8, F10, F11, F12, F13, F14>(
+    pub fn new<F8, F10, F11, F12, F13, F14, F15, F16>(
         type_: Type,
         encodings: Vec<Encoding>,
         path_in_schema: Vec<String>,
@@ -6828,6 +7310,8 @@ impl ColumnMetaData {
         statistics: F12,
         encoding_stats: F13,
         bloom_filter_offset: F14,
+        bloom_filter_length: F15,
+        size_statistics: F16,
     ) -> ColumnMetaData
     where
         F8: Into<Option<Vec<KeyValue>>>,
@@ -6836,6 +7320,8 @@ impl ColumnMetaData {
         F12: Into<Option<Statistics>>,
         F13: Into<Option<Vec<PageEncodingStats>>>,
         F14: Into<Option<i64>>,
+        F15: Into<Option<i32>>,
+        F16: Into<Option<SizeStatistics>>,
     {
         ColumnMetaData {
             type_,
@@ -6852,6 +7338,8 @@ impl ColumnMetaData {
             statistics: statistics.into(),
             encoding_stats: encoding_stats.into(),
             bloom_filter_offset: bloom_filter_offset.into(),
+            bloom_filter_length: bloom_filter_length.into(),
+            size_statistics: size_statistics.into(),
         }
     }
 
@@ -6989,6 +7477,24 @@ impl ColumnMetaData {
                 14,
             ))?;
             written += o_prot.write_i64(fld_var)?;
+            written += o_prot.write_field_end()?;
+        }
+        if let Some(fld_var) = self.bloom_filter_length {
+            written += o_prot.write_field_begin(&TFieldIdentifier::new(
+                "bloom_filter_length",
+                TType::I32,
+                15,
+            ))?;
+            written += o_prot.write_i32(fld_var)?;
+            written += o_prot.write_field_end()?;
+        }
+        if let Some(ref fld_var) = self.size_statistics {
+            written += o_prot.write_field_begin(&TFieldIdentifier::new(
+                "size_statistics",
+                TType::Struct,
+                16,
+            ))?;
+            written += fld_var.write_to_out_protocol(o_prot)?;
             written += o_prot.write_field_end()?;
         }
         written += o_prot.write_field_stop()?;
@@ -7137,6 +7643,24 @@ impl ColumnMetaData {
             written += o_prot.write_i64(fld_var).await?;
             written += o_prot.write_field_end()?;
         }
+        if let Some(fld_var) = self.bloom_filter_length {
+            written += o_prot
+                .write_field_begin(&TFieldIdentifier::new(
+                    "bloom_filter_length",
+                    TType::I32,
+                    15,
+                ))
+                .await?;
+            written += o_prot.write_i32(fld_var).await?;
+            written += o_prot.write_field_end()?;
+        }
+        if let Some(ref fld_var) = self.size_statistics {
+            written += o_prot
+                .write_field_begin(&TFieldIdentifier::new("size_statistics", TType::Struct, 16))
+                .await?;
+            written += fld_var.write_to_out_stream_protocol(o_prot).await?;
+            written += o_prot.write_field_end()?;
+        }
         written += o_prot.write_field_stop().await?;
         written += o_prot.write_struct_end()?;
         Ok(written)
@@ -7160,6 +7684,8 @@ impl ReadThrift for ColumnMetaData {
         let mut f_12: Option<Statistics> = None;
         let mut f_13: Option<Vec<PageEncodingStats>> = None;
         let mut f_14: Option<i64> = None;
+        let mut f_15: Option<i32> = None;
+        let mut f_16: Option<SizeStatistics> = None;
         loop {
             let field_ident = i_prot.read_field_begin()?;
             if field_ident.field_type == TType::Stop {
@@ -7170,62 +7696,70 @@ impl ReadThrift for ColumnMetaData {
                 1 => {
                     let val = Type::read_from_in_protocol(i_prot)?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_list()?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_list()?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = CompressionCodec::read_from_in_protocol(i_prot)?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = i_prot.read_i64()?;
                     f_5 = Some(val);
-                },
+                }
                 6 => {
                     let val = i_prot.read_i64()?;
                     f_6 = Some(val);
-                },
+                }
                 7 => {
                     let val = i_prot.read_i64()?;
                     f_7 = Some(val);
-                },
+                }
                 8 => {
                     let val = i_prot.read_list()?;
                     f_8 = Some(val);
-                },
+                }
                 9 => {
                     let val = i_prot.read_i64()?;
                     f_9 = Some(val);
-                },
+                }
                 10 => {
                     let val = i_prot.read_i64()?;
                     f_10 = Some(val);
-                },
+                }
                 11 => {
                     let val = i_prot.read_i64()?;
                     f_11 = Some(val);
-                },
+                }
                 12 => {
                     let val = Statistics::read_from_in_protocol(i_prot)?;
                     f_12 = Some(val);
-                },
+                }
                 13 => {
                     let val = i_prot.read_list()?;
                     f_13 = Some(val);
-                },
+                }
                 14 => {
                     let val = i_prot.read_i64()?;
                     f_14 = Some(val);
-                },
+                }
+                15 => {
+                    let val = i_prot.read_i32()?;
+                    f_15 = Some(val);
+                }
+                16 => {
+                    let val = SizeStatistics::read_from_in_protocol(i_prot)?;
+                    f_16 = Some(val);
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -7261,6 +7795,8 @@ impl ReadThrift for ColumnMetaData {
             statistics: f_12,
             encoding_stats: f_13,
             bloom_filter_offset: f_14,
+            bloom_filter_length: f_15,
+            size_statistics: f_16,
         };
         Ok(ret)
     }
@@ -7287,6 +7823,8 @@ impl AsyncReadThrift for ColumnMetaData {
         let mut f_12: Option<Statistics> = None;
         let mut f_13: Option<Vec<PageEncodingStats>> = None;
         let mut f_14: Option<i64> = None;
+        let mut f_15: Option<i32> = None;
+        let mut f_16: Option<SizeStatistics> = None;
         loop {
             let field_ident = i_prot.read_field_begin().await?;
             if field_ident.field_type == TType::Stop {
@@ -7297,62 +7835,70 @@ impl AsyncReadThrift for ColumnMetaData {
                 1 => {
                     let val = Type::stream_from_in_protocol(i_prot).await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_list().await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_list().await?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = CompressionCodec::stream_from_in_protocol(i_prot).await?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = i_prot.read_i64().await?;
                     f_5 = Some(val);
-                },
+                }
                 6 => {
                     let val = i_prot.read_i64().await?;
                     f_6 = Some(val);
-                },
+                }
                 7 => {
                     let val = i_prot.read_i64().await?;
                     f_7 = Some(val);
-                },
+                }
                 8 => {
                     let val = i_prot.read_list().await?;
                     f_8 = Some(val);
-                },
+                }
                 9 => {
                     let val = i_prot.read_i64().await?;
                     f_9 = Some(val);
-                },
+                }
                 10 => {
                     let val = i_prot.read_i64().await?;
                     f_10 = Some(val);
-                },
+                }
                 11 => {
                     let val = i_prot.read_i64().await?;
                     f_11 = Some(val);
-                },
+                }
                 12 => {
                     let val = Statistics::stream_from_in_protocol(i_prot).await?;
                     f_12 = Some(val);
-                },
+                }
                 13 => {
                     let val = i_prot.read_list().await?;
                     f_13 = Some(val);
-                },
+                }
                 14 => {
                     let val = i_prot.read_i64().await?;
                     f_14 = Some(val);
-                },
+                }
+                15 => {
+                    let val = i_prot.read_i32().await?;
+                    f_15 = Some(val);
+                }
+                16 => {
+                    let val = SizeStatistics::stream_from_in_protocol(i_prot).await?;
+                    f_16 = Some(val);
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -7388,6 +7934,8 @@ impl AsyncReadThrift for ColumnMetaData {
             statistics: f_12,
             encoding_stats: f_13,
             bloom_filter_offset: f_14,
+            bloom_filter_length: f_15,
+            size_statistics: f_16,
         };
         Ok(ret)
     }
@@ -7604,14 +8152,14 @@ impl ReadThrift for EncryptionWithColumnKey {
                 1 => {
                     let val = i_prot.read_list()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_bytes()?;
                     f_2 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -7645,14 +8193,14 @@ impl AsyncReadThrift for EncryptionWithColumnKey {
                 1 => {
                     let val = i_prot.read_list().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_bytes().await?;
                     f_2 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -7706,7 +8254,7 @@ impl ColumnCryptoMetaData {
                 ))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             ColumnCryptoMetaData::ENCRYPTIONWITHCOLUMNKEY(ref f) => {
                 written += o_prot.write_field_begin(&TFieldIdentifier::new(
                     "ENCRYPTION_WITH_COLUMN_KEY",
@@ -7715,7 +8263,7 @@ impl ColumnCryptoMetaData {
                 ))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
         }
         written += o_prot.write_field_stop()?;
         written += o_prot.write_struct_end()?;
@@ -7739,7 +8287,7 @@ impl ColumnCryptoMetaData {
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             ColumnCryptoMetaData::ENCRYPTIONWITHCOLUMNKEY(ref f) => {
                 written += o_prot
                     .write_field_begin(&TFieldIdentifier::new(
@@ -7750,7 +8298,7 @@ impl ColumnCryptoMetaData {
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
         }
         written += o_prot.write_field_stop().await?;
         written += o_prot.write_struct_end()?;
@@ -7778,18 +8326,18 @@ impl ReadThrift for ColumnCryptoMetaData {
                         ret = Some(ColumnCryptoMetaData::ENCRYPTIONWITHFOOTERKEY(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 2 => {
                     let val = EncryptionWithColumnKey::read_from_in_protocol(i_prot)?;
                     if ret.is_none() {
                         ret = Some(ColumnCryptoMetaData::ENCRYPTIONWITHCOLUMNKEY(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
                     received_field_count += 1;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -7837,18 +8385,18 @@ impl AsyncReadThrift for ColumnCryptoMetaData {
                         ret = Some(ColumnCryptoMetaData::ENCRYPTIONWITHFOOTERKEY(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 2 => {
                     let val = EncryptionWithColumnKey::stream_from_in_protocol(i_prot).await?;
                     if ret.is_none() {
                         ret = Some(ColumnCryptoMetaData::ENCRYPTIONWITHCOLUMNKEY(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
                     received_field_count += 1;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -7884,11 +8432,19 @@ pub struct ColumnChunk {
     /// metadata.  This path is relative to the current file.
     ///
     pub file_path: Option<String>,
-    /// Byte offset in file_path to the ColumnMetaData *
+    /// Deprecated: Byte offset in file_path to the ColumnMetaData
+    ///
+    /// Past use of this field has been inconsistent, with some implementations
+    /// using it to point to the ColumnMetaData and some using it to point to
+    /// the first page in the column chunk. In many cases, the ColumnMetaData at this
+    /// location is wrong. This field is now deprecated and should not be used.
+    /// Writers should set this field to 0 if no ColumnMetaData has been written outside
+    /// the footer.
     pub file_offset: i64,
-    /// Column metadata for this chunk. This is the same content as what is at
-    /// file_path/file_offset.  Having it here has it replicated in the file
-    /// metadata.
+    /// Column metadata for this chunk. Some writers may also replicate this at the
+    /// location pointed to by file_path/file_offset.
+    /// Note: while marked as optional, this field is in fact required by most major
+    /// Parquet implementations. As such, writers MUST populate this field.
     ///
     pub meta_data: Option<ColumnMetaData>,
     /// File offset of ColumnChunk's OffsetIndex *
@@ -8133,42 +8689,42 @@ impl ReadThrift for ColumnChunk {
                 1 => {
                     let val = i_prot.read_string()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_i64()?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = ColumnMetaData::read_from_in_protocol(i_prot)?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = i_prot.read_i64()?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = i_prot.read_i32()?;
                     f_5 = Some(val);
-                },
+                }
                 6 => {
                     let val = i_prot.read_i64()?;
                     f_6 = Some(val);
-                },
+                }
                 7 => {
                     let val = i_prot.read_i32()?;
                     f_7 = Some(val);
-                },
+                }
                 8 => {
                     let val = ColumnCryptoMetaData::read_from_in_protocol(i_prot)?;
                     f_8 = Some(val);
-                },
+                }
                 9 => {
                     let val = i_prot.read_bytes()?;
                     f_9 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -8216,42 +8772,42 @@ impl AsyncReadThrift for ColumnChunk {
                 1 => {
                     let val = i_prot.read_string().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_i64().await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = ColumnMetaData::stream_from_in_protocol(i_prot).await?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = i_prot.read_i64().await?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = i_prot.read_i32().await?;
                     f_5 = Some(val);
-                },
+                }
                 6 => {
                     let val = i_prot.read_i64().await?;
                     f_6 = Some(val);
-                },
+                }
                 7 => {
                     let val = i_prot.read_i32().await?;
                     f_7 = Some(val);
-                },
+                }
                 8 => {
                     let val = ColumnCryptoMetaData::stream_from_in_protocol(i_prot).await?;
                     f_8 = Some(val);
-                },
+                }
                 9 => {
                     let val = i_prot.read_bytes().await?;
                     f_9 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -8502,34 +9058,34 @@ impl ReadThrift for RowGroup {
                 1 => {
                     let val = i_prot.read_list()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_i64()?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_i64()?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = i_prot.read_list()?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = i_prot.read_i64()?;
                     f_5 = Some(val);
-                },
+                }
                 6 => {
                     let val = i_prot.read_i64()?;
                     f_6 = Some(val);
-                },
+                }
                 7 => {
                     let val = i_prot.read_i16()?;
                     f_7 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -8577,34 +9133,34 @@ impl AsyncReadThrift for RowGroup {
                 1 => {
                     let val = i_prot.read_list().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_i64().await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_i64().await?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = i_prot.read_list().await?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = i_prot.read_i64().await?;
                     f_5 = Some(val);
-                },
+                }
                 6 => {
                     let val = i_prot.read_i64().await?;
                     f_6 = Some(val);
-                },
+                }
                 7 => {
                     let val = i_prot.read_i16().await?;
                     f_7 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -8757,7 +9313,7 @@ impl ColumnOrder {
                 ))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
         }
         written += o_prot.write_field_stop()?;
         written += o_prot.write_struct_end()?;
@@ -8777,7 +9333,7 @@ impl ColumnOrder {
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
         }
         written += o_prot.write_field_stop().await?;
         written += o_prot.write_struct_end()?;
@@ -8803,11 +9359,11 @@ impl ReadThrift for ColumnOrder {
                         ret = Some(ColumnOrder::TYPEORDER(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
                     received_field_count += 1;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -8855,11 +9411,11 @@ impl AsyncReadThrift for ColumnOrder {
                         ret = Some(ColumnOrder::TYPEORDER(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
                     received_field_count += 1;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -8896,8 +9452,9 @@ pub struct PageLocation {
     /// Size of the page, including header. Sum of compressed_page_size and header
     /// length
     pub compressed_page_size: i32,
-    /// Index within the RowGroup of the first row of the page; this means pages
-    /// change on record boundaries (r = 0).
+    /// Index within the RowGroup of the first row of the page. When an
+    /// OffsetIndex is present, pages must begin on row boundaries
+    /// (repetition_level = 0).
     pub first_row_index: i64,
 }
 
@@ -8997,18 +9554,18 @@ impl ReadThrift for PageLocation {
                 1 => {
                     let val = i_prot.read_i64()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_i32()?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_i64()?;
                     f_3 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -9048,18 +9605,18 @@ impl AsyncReadThrift for PageLocation {
                 1 => {
                     let val = i_prot.read_i64().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_i32().await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_i64().await?;
                     f_3 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -9083,16 +9640,35 @@ impl AsyncReadThrift for PageLocation {
 // OffsetIndex
 //
 
+/// Optional offsets for each data page in a ColumnChunk.
+///
+/// Forms part of the page index, along with ColumnIndex.
+///
+/// OffsetIndex may be present even if ColumnIndex is not.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct OffsetIndex {
     /// PageLocations, ordered by increasing PageLocation.offset. It is required
     /// that page_locations[i].first_row_index < page_locations[i+1].first_row_index.
     pub page_locations: Vec<PageLocation>,
+    /// Unencoded/uncompressed size for BYTE_ARRAY types.
+    ///
+    /// See documention for unencoded_byte_array_data_bytes in SizeStatistics for
+    /// more details on this field.
+    pub unencoded_byte_array_data_bytes: Option<Vec<i64>>,
 }
 
 impl OffsetIndex {
-    pub fn new(page_locations: Vec<PageLocation>) -> OffsetIndex {
-        OffsetIndex { page_locations }
+    pub fn new<F2>(
+        page_locations: Vec<PageLocation>,
+        unencoded_byte_array_data_bytes: F2,
+    ) -> OffsetIndex
+    where
+        F2: Into<Option<Vec<i64>>>,
+    {
+        OffsetIndex {
+            page_locations,
+            unencoded_byte_array_data_bytes: unencoded_byte_array_data_bytes.into(),
+        }
     }
 
     pub fn read_from_in_protocol<T: TInputProtocol>(i_prot: &mut T) -> thrift::Result<OffsetIndex> {
@@ -9124,6 +9700,20 @@ impl OffsetIndex {
         }
         written += o_prot.write_list_end()?;
         written += o_prot.write_field_end()?;
+        if let Some(ref fld_var) = self.unencoded_byte_array_data_bytes {
+            written += o_prot.write_field_begin(&TFieldIdentifier::new(
+                "unencoded_byte_array_data_bytes",
+                TType::List,
+                2,
+            ))?;
+            written += o_prot
+                .write_list_begin(&TListIdentifier::new(TType::I64, fld_var.len().try_into()?))?;
+            for e in fld_var {
+                written += o_prot.write_i64(*e)?;
+            }
+            written += o_prot.write_list_end()?;
+            written += o_prot.write_field_end()?;
+        }
         written += o_prot.write_field_stop()?;
         written += o_prot.write_struct_end()?;
         Ok(written)
@@ -9150,6 +9740,23 @@ impl OffsetIndex {
         }
         written += o_prot.write_list_end().await?;
         written += o_prot.write_field_end()?;
+        if let Some(ref fld_var) = self.unencoded_byte_array_data_bytes {
+            written += o_prot
+                .write_field_begin(&TFieldIdentifier::new(
+                    "unencoded_byte_array_data_bytes",
+                    TType::List,
+                    2,
+                ))
+                .await?;
+            written += o_prot
+                .write_list_begin(&TListIdentifier::new(TType::I64, fld_var.len().try_into()?))
+                .await?;
+            for e in fld_var {
+                written += o_prot.write_i64(*e).await?;
+            }
+            written += o_prot.write_list_end().await?;
+            written += o_prot.write_field_end()?;
+        }
         written += o_prot.write_field_stop().await?;
         written += o_prot.write_struct_end()?;
         Ok(written)
@@ -9160,6 +9767,7 @@ impl ReadThrift for OffsetIndex {
     fn read_from_in_protocol<T: TInputProtocol>(i_prot: &mut T) -> thrift::Result<OffsetIndex> {
         i_prot.read_struct_begin()?;
         let mut f_1: Option<Vec<PageLocation>> = None;
+        let mut f_2: Option<Vec<i64>> = None;
         loop {
             let field_ident = i_prot.read_field_begin()?;
             if field_ident.field_type == TType::Stop {
@@ -9170,10 +9778,14 @@ impl ReadThrift for OffsetIndex {
                 1 => {
                     let val = i_prot.read_list()?;
                     f_1 = Some(val);
-                },
+                }
+                2 => {
+                    let val = i_prot.read_list()?;
+                    f_2 = Some(val);
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -9182,6 +9794,7 @@ impl ReadThrift for OffsetIndex {
         let ret = OffsetIndex {
             page_locations: f_1
                 .expect("auto-generated code should have checked for presence of required fields"),
+            unencoded_byte_array_data_bytes: f_2,
         };
         Ok(ret)
     }
@@ -9195,6 +9808,7 @@ impl AsyncReadThrift for OffsetIndex {
     ) -> thrift::Result<OffsetIndex> {
         i_prot.read_struct_begin().await?;
         let mut f_1: Option<Vec<PageLocation>> = None;
+        let mut f_2: Option<Vec<i64>> = None;
         loop {
             let field_ident = i_prot.read_field_begin().await?;
             if field_ident.field_type == TType::Stop {
@@ -9205,10 +9819,14 @@ impl AsyncReadThrift for OffsetIndex {
                 1 => {
                     let val = i_prot.read_list().await?;
                     f_1 = Some(val);
-                },
+                }
+                2 => {
+                    let val = i_prot.read_list().await?;
+                    f_2 = Some(val);
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -9217,6 +9835,7 @@ impl AsyncReadThrift for OffsetIndex {
         let ret = OffsetIndex {
             page_locations: f_1
                 .expect("auto-generated code should have checked for presence of required fields"),
+            unencoded_byte_array_data_bytes: f_2,
         };
         Ok(ret)
     }
@@ -9226,8 +9845,14 @@ impl AsyncReadThrift for OffsetIndex {
 // ColumnIndex
 //
 
-/// Description for ColumnIndex.
-/// Each <array-field>[i] refers to the page at OffsetIndex.page_locations[i]
+/// Optional statistics for each data page in a ColumnChunk.
+///
+/// Forms part the page index, along with OffsetIndex.
+///
+/// If this structure is present, OffsetIndex must also be present.
+///
+/// For each field in this structure, <field>[i] refers to the page at
+/// OffsetIndex.page_locations[i]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ColumnIndex {
     /// A list of Boolean values to determine the validity of the corresponding
@@ -9246,25 +9871,51 @@ pub struct ColumnIndex {
     /// using them by inspecting null_pages.
     pub min_values: Vec<Vec<u8>>,
     pub max_values: Vec<Vec<u8>>,
-    /// Stores whether both min_values and max_values are orderd and if so, in
+    /// Stores whether both min_values and max_values are ordered and if so, in
     /// which direction. This allows readers to perform binary searches in both
     /// lists. Readers cannot assume that max_values[i] <= min_values[i+1], even
     /// if the lists are ordered.
     pub boundary_order: BoundaryOrder,
-    /// A list containing the number of null values for each page *
+    /// A list containing the number of null values for each page
+    ///
+    /// Writers SHOULD always write this field even if no null values
+    /// are present or the column is not nullable.
+    /// Readers MUST distinguish between null_counts not being present
+    /// and null_count being 0.
+    /// If null_counts are not present, readers MUST NOT assume all
+    /// null counts are 0.
     pub null_counts: Option<Vec<i64>>,
+    /// Contains repetition level histograms for each page
+    /// concatenated together.  The repetition_level_histogram field on
+    /// SizeStatistics contains more details.
+    ///
+    /// When present the length should always be (number of pages *
+    /// (max_repetition_level + 1)) elements.
+    ///
+    /// Element 0 is the first element of the histogram for the first page.
+    /// Element (max_repetition_level + 1) is the first element of the histogram
+    /// for the second page.
+    ///
+    pub repetition_level_histograms: Option<Vec<i64>>,
+    /// Same as repetition_level_histograms except for definitions levels.
+    ///
+    pub definition_level_histograms: Option<Vec<i64>>,
 }
 
 impl ColumnIndex {
-    pub fn new<F5>(
+    pub fn new<F5, F6, F7>(
         null_pages: Vec<bool>,
         min_values: Vec<Vec<u8>>,
         max_values: Vec<Vec<u8>>,
         boundary_order: BoundaryOrder,
         null_counts: F5,
+        repetition_level_histograms: F6,
+        definition_level_histograms: F7,
     ) -> ColumnIndex
     where
         F5: Into<Option<Vec<i64>>>,
+        F6: Into<Option<Vec<i64>>>,
+        F7: Into<Option<Vec<i64>>>,
     {
         ColumnIndex {
             null_pages,
@@ -9272,6 +9923,8 @@ impl ColumnIndex {
             max_values,
             boundary_order,
             null_counts: null_counts.into(),
+            repetition_level_histograms: repetition_level_histograms.into(),
+            definition_level_histograms: definition_level_histograms.into(),
         }
     }
 
@@ -9333,6 +9986,34 @@ impl ColumnIndex {
         if let Some(ref fld_var) = self.null_counts {
             written +=
                 o_prot.write_field_begin(&TFieldIdentifier::new("null_counts", TType::List, 5))?;
+            written += o_prot
+                .write_list_begin(&TListIdentifier::new(TType::I64, fld_var.len().try_into()?))?;
+            for e in fld_var {
+                written += o_prot.write_i64(*e)?;
+            }
+            written += o_prot.write_list_end()?;
+            written += o_prot.write_field_end()?;
+        }
+        if let Some(ref fld_var) = self.repetition_level_histograms {
+            written += o_prot.write_field_begin(&TFieldIdentifier::new(
+                "repetition_level_histograms",
+                TType::List,
+                6,
+            ))?;
+            written += o_prot
+                .write_list_begin(&TListIdentifier::new(TType::I64, fld_var.len().try_into()?))?;
+            for e in fld_var {
+                written += o_prot.write_i64(*e)?;
+            }
+            written += o_prot.write_list_end()?;
+            written += o_prot.write_field_end()?;
+        }
+        if let Some(ref fld_var) = self.definition_level_histograms {
+            written += o_prot.write_field_begin(&TFieldIdentifier::new(
+                "definition_level_histograms",
+                TType::List,
+                7,
+            ))?;
             written += o_prot
                 .write_list_begin(&TListIdentifier::new(TType::I64, fld_var.len().try_into()?))?;
             for e in fld_var {
@@ -9416,6 +10097,40 @@ impl ColumnIndex {
             written += o_prot.write_list_end().await?;
             written += o_prot.write_field_end()?;
         }
+        if let Some(ref fld_var) = self.repetition_level_histograms {
+            written += o_prot
+                .write_field_begin(&TFieldIdentifier::new(
+                    "repetition_level_histograms",
+                    TType::List,
+                    6,
+                ))
+                .await?;
+            written += o_prot
+                .write_list_begin(&TListIdentifier::new(TType::I64, fld_var.len().try_into()?))
+                .await?;
+            for e in fld_var {
+                written += o_prot.write_i64(*e).await?;
+            }
+            written += o_prot.write_list_end().await?;
+            written += o_prot.write_field_end()?;
+        }
+        if let Some(ref fld_var) = self.definition_level_histograms {
+            written += o_prot
+                .write_field_begin(&TFieldIdentifier::new(
+                    "definition_level_histograms",
+                    TType::List,
+                    7,
+                ))
+                .await?;
+            written += o_prot
+                .write_list_begin(&TListIdentifier::new(TType::I64, fld_var.len().try_into()?))
+                .await?;
+            for e in fld_var {
+                written += o_prot.write_i64(*e).await?;
+            }
+            written += o_prot.write_list_end().await?;
+            written += o_prot.write_field_end()?;
+        }
         written += o_prot.write_field_stop().await?;
         written += o_prot.write_struct_end()?;
         Ok(written)
@@ -9430,6 +10145,8 @@ impl ReadThrift for ColumnIndex {
         let mut f_3: Option<Vec<Vec<u8>>> = None;
         let mut f_4: Option<BoundaryOrder> = None;
         let mut f_5: Option<Vec<i64>> = None;
+        let mut f_6: Option<Vec<i64>> = None;
+        let mut f_7: Option<Vec<i64>> = None;
         loop {
             let field_ident = i_prot.read_field_begin()?;
             if field_ident.field_type == TType::Stop {
@@ -9440,26 +10157,34 @@ impl ReadThrift for ColumnIndex {
                 1 => {
                     let val = i_prot.read_list()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_list()?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_list()?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = BoundaryOrder::read_from_in_protocol(i_prot)?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = i_prot.read_list()?;
                     f_5 = Some(val);
-                },
+                }
+                6 => {
+                    let val = i_prot.read_list()?;
+                    f_6 = Some(val);
+                }
+                7 => {
+                    let val = i_prot.read_list()?;
+                    f_7 = Some(val);
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -9478,6 +10203,8 @@ impl ReadThrift for ColumnIndex {
             boundary_order: f_4
                 .expect("auto-generated code should have checked for presence of required fields"),
             null_counts: f_5,
+            repetition_level_histograms: f_6,
+            definition_level_histograms: f_7,
         };
         Ok(ret)
     }
@@ -9495,6 +10222,8 @@ impl AsyncReadThrift for ColumnIndex {
         let mut f_3: Option<Vec<Vec<u8>>> = None;
         let mut f_4: Option<BoundaryOrder> = None;
         let mut f_5: Option<Vec<i64>> = None;
+        let mut f_6: Option<Vec<i64>> = None;
+        let mut f_7: Option<Vec<i64>> = None;
         loop {
             let field_ident = i_prot.read_field_begin().await?;
             if field_ident.field_type == TType::Stop {
@@ -9505,26 +10234,34 @@ impl AsyncReadThrift for ColumnIndex {
                 1 => {
                     let val = i_prot.read_list().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_list().await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_list().await?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = BoundaryOrder::stream_from_in_protocol(i_prot).await?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = i_prot.read_list().await?;
                     f_5 = Some(val);
-                },
+                }
+                6 => {
+                    let val = i_prot.read_list().await?;
+                    f_6 = Some(val);
+                }
+                7 => {
+                    let val = i_prot.read_list().await?;
+                    f_7 = Some(val);
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -9543,6 +10280,8 @@ impl AsyncReadThrift for ColumnIndex {
             boundary_order: f_4
                 .expect("auto-generated code should have checked for presence of required fields"),
             null_counts: f_5,
+            repetition_level_histograms: f_6,
+            definition_level_histograms: f_7,
         };
         Ok(ret)
     }
@@ -9674,18 +10413,18 @@ impl ReadThrift for AesGcmV1 {
                 1 => {
                     let val = i_prot.read_bytes()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_bytes()?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_bool()?;
                     f_3 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -9719,18 +10458,18 @@ impl AsyncReadThrift for AesGcmV1 {
                 1 => {
                     let val = i_prot.read_bytes().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_bytes().await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_bool().await?;
                     f_3 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -9874,18 +10613,18 @@ impl ReadThrift for AesGcmCtrV1 {
                 1 => {
                     let val = i_prot.read_bytes()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_bytes()?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_bool()?;
                     f_3 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -9919,18 +10658,18 @@ impl AsyncReadThrift for AesGcmCtrV1 {
                 1 => {
                     let val = i_prot.read_bytes().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_bytes().await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_bool().await?;
                     f_3 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -9983,7 +10722,7 @@ impl EncryptionAlgorithm {
                 ))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             EncryptionAlgorithm::AESGCMCTRV1(ref f) => {
                 written += o_prot.write_field_begin(&TFieldIdentifier::new(
                     "AES_GCM_CTR_V1",
@@ -9992,7 +10731,7 @@ impl EncryptionAlgorithm {
                 ))?;
                 written += f.write_to_out_protocol(o_prot)?;
                 written += o_prot.write_field_end()?;
-            },
+            }
         }
         written += o_prot.write_field_stop()?;
         written += o_prot.write_struct_end()?;
@@ -10012,14 +10751,14 @@ impl EncryptionAlgorithm {
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
             EncryptionAlgorithm::AESGCMCTRV1(ref f) => {
                 written += o_prot
                     .write_field_begin(&TFieldIdentifier::new("AES_GCM_CTR_V1", TType::Struct, 2))
                     .await?;
                 written += f.write_to_out_stream_protocol(o_prot).await?;
                 written += o_prot.write_field_end()?;
-            },
+            }
         }
         written += o_prot.write_field_stop().await?;
         written += o_prot.write_struct_end()?;
@@ -10047,18 +10786,18 @@ impl ReadThrift for EncryptionAlgorithm {
                         ret = Some(EncryptionAlgorithm::AESGCMV1(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 2 => {
                     let val = AesGcmCtrV1::read_from_in_protocol(i_prot)?;
                     if ret.is_none() {
                         ret = Some(EncryptionAlgorithm::AESGCMCTRV1(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
                     received_field_count += 1;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -10106,18 +10845,18 @@ impl AsyncReadThrift for EncryptionAlgorithm {
                         ret = Some(EncryptionAlgorithm::AESGCMV1(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 2 => {
                     let val = AesGcmCtrV1::stream_from_in_protocol(i_prot).await?;
                     if ret.is_none() {
                         ret = Some(EncryptionAlgorithm::AESGCMCTRV1(val));
                     }
                     received_field_count += 1;
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
                     received_field_count += 1;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -10468,42 +11207,42 @@ impl ReadThrift for FileMetaData {
                 1 => {
                     let val = i_prot.read_i32()?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_list()?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_i64()?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = i_prot.read_list()?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = i_prot.read_list()?;
                     f_5 = Some(val);
-                },
+                }
                 6 => {
                     let val = i_prot.read_string()?;
                     f_6 = Some(val);
-                },
+                }
                 7 => {
                     let val = i_prot.read_list()?;
                     f_7 = Some(val);
-                },
+                }
                 8 => {
                     let val = EncryptionAlgorithm::read_from_in_protocol(i_prot)?;
                     f_8 = Some(val);
-                },
+                }
                 9 => {
                     let val = i_prot.read_bytes()?;
                     f_9 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -10557,42 +11296,42 @@ impl AsyncReadThrift for FileMetaData {
                 1 => {
                     let val = i_prot.read_i32().await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_list().await?;
                     f_2 = Some(val);
-                },
+                }
                 3 => {
                     let val = i_prot.read_i64().await?;
                     f_3 = Some(val);
-                },
+                }
                 4 => {
                     let val = i_prot.read_list().await?;
                     f_4 = Some(val);
-                },
+                }
                 5 => {
                     let val = i_prot.read_list().await?;
                     f_5 = Some(val);
-                },
+                }
                 6 => {
                     let val = i_prot.read_string().await?;
                     f_6 = Some(val);
-                },
+                }
                 7 => {
                     let val = i_prot.read_list().await?;
                     f_7 = Some(val);
-                },
+                }
                 8 => {
                     let val = EncryptionAlgorithm::stream_from_in_protocol(i_prot).await?;
                     f_8 = Some(val);
-                },
+                }
                 9 => {
                     let val = i_prot.read_bytes().await?;
                     f_9 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
@@ -10740,14 +11479,14 @@ impl ReadThrift for FileCryptoMetaData {
                 1 => {
                     let val = EncryptionAlgorithm::read_from_in_protocol(i_prot)?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_bytes()?;
                     f_2 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
-                },
+                }
             };
             i_prot.read_field_end()?;
         }
@@ -10781,14 +11520,14 @@ impl AsyncReadThrift for FileCryptoMetaData {
                 1 => {
                     let val = EncryptionAlgorithm::stream_from_in_protocol(i_prot).await?;
                     f_1 = Some(val);
-                },
+                }
                 2 => {
                     let val = i_prot.read_bytes().await?;
                     f_2 = Some(val);
-                },
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type).await?;
-                },
+                }
             };
             i_prot.read_field_end().await?;
         }
