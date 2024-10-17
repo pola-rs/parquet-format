@@ -1,0 +1,25 @@
+[package]
+name = "polars-parquet-format"
+version = "2.10.0-rc.0"
+authors = [
+  "Apache Thrift contributors <dev@thrift.apache.org>",
+  "Jorge Leitao <jorgecarleitao@gmail.com>",
+  "Gijs Burghoorn <gijs@polars.tech>",
+]
+edition = "2021"
+homepage = "https://github.com/pola-rs/parquet-format"
+keywords = ["parquet", "thrift"]
+license = "MIT AND Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/pola-rs/parquet-format"
+description = "Safe Parquet and Thrift reader and writer (sync and async)"
+
+[dependencies]
+async-trait = { version = "0.1", optional = true }
+futures = { version = "0.3.25", optional = true }
+
+[dev-dependencies]
+tokio = "1.26"
+
+[features]
+async = ["futures", "async-trait"]
