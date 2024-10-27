@@ -1,10 +1,11 @@
 [package]
 name = "polars-parquet-format"
-version = "2.10.0"
+version = "0.1.0"
 authors = [
   "Apache Thrift contributors <dev@thrift.apache.org>",
   "Jorge Leitao <jorgecarleitao@gmail.com>",
   "Gijs Burghoorn <gijs@polars.tech>",
+  "Ritchie Vink <ritchie@polars.tech>",
 ]
 edition = "2021"
 homepage = "https://github.com/pola-rs/parquet-format"
