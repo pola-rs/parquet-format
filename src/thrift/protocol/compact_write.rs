@@ -45,7 +45,7 @@ where
         let mut written = 0;
 
         let field_delta = field_id - self.last_write_field_id;
-        if field_delta > 0 && field_delta < 15 {
+        if field_delta > 0 && field_delta < 16 {
             written += self.write_byte(((field_delta as u8) << 4) | field_type)?;
         } else {
             written += self.write_byte(field_type)?;
